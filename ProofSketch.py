@@ -22,9 +22,9 @@ os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"  # faster dl
 if HF_TOKEN:
     try:
         login(token=HF_TOKEN, add_to_git_credential=True)
-        print("✅ Hugging Face login successful.")
+        print("Hugging Face login successful.")
     except Exception as e:
-        print("⚠️ HF login failed (continuing without):", e)
+        print("HF login failed (continuing without):", e)
 
 # ----- Load tokenizer & model (with optional 4-bit on GPU) -----
 load_kwargs = {}
@@ -293,7 +293,7 @@ def run_sketch(theory: str, question: str):
 
     data = extract_best_json(out)
     if data is None:
-        print("⚠️ No valid JSON found, retrying once...")
+        print("No valid JSON found, retrying once...")
         out = generate(SKETCH_PROMPT.format(theory=theory, question=question),
                        160, temperature=0.0)
         print("\n[RAW MODEL OUTPUT - RETRY]")
@@ -384,7 +384,7 @@ def _anchor_claims(theory, question, claims, pos, neg):
 def _gen_sketch_once_strict(theory, question, max_new, temp):
     raw = generate(
         SKETCH_PROMPT.format(theory=theory, question=question),
-        max_new_tokens=max_new,      # ✅ change here
+        max_new_tokens=max_new,      
         temperature=temp,
         do_sample=(temp > 0),
         stop_at_json=True
