@@ -2,7 +2,7 @@ import os, torch, re, time, numpy as np
 from huggingface_hub import login
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# ----- HF config (edit these if needed) -----
+
 MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"   
 HF_TOKEN   = "" 
 HF_CACHE   = "/kaggle/working/hf_cache"              
@@ -18,7 +18,7 @@ os.environ["HF_DATASETS_CACHE"] = os.path.join(HF_CACHE, "datasets")
 os.environ["TRANSFORMERS_CACHE"] = os.path.join(HF_CACHE, "transformers")
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"  # faster dl
 
-# ----- Optional: login if you provided a token -----
+
 if HF_TOKEN:
     try:
         login(token=HF_TOKEN, add_to_git_credential=True)
@@ -26,7 +26,7 @@ if HF_TOKEN:
     except Exception as e:
         print("HF login failed (continuing without):", e)
 
-# ----- Load tokenizer & model (with optional 4-bit on GPU) -----
+]
 load_kwargs = {}
 if torch.cuda.is_available():
     load_kwargs.update(dict(
@@ -168,10 +168,10 @@ def extract_vocab_from_theory(theory: str):
     - Entities: capitalized single names (Anne, Harry, etc.)
     - Attributes: lowercase adjectives appearing after 'is/are' (+ parsed rules/facts)
     """
-    # Entities (single ProperCase tokens)
+
     ents = set(re.findall(r"\b[A-Z][a-z]+\b", theory))
 
-    # Attributes from surface patterns: "is <attr>", "is not <attr>", "are <attr>", "are not <attr>"
+
     attr_candidates = []
     for m in re.finditer(r"\bis\s+(?:not\s+)?([a-z]+)\b", theory):
         attr_candidates.append(m.group(1))
@@ -195,7 +195,7 @@ def extract_vocab_from_theory(theory: str):
     return ents, attrs
 
 
-# --- Strict JSON prompts + sanitize (robust) ---
+
 
 MAX_NEW_TOKENS_SKETCH = 220
 MAX_NEW_TOKENS_EXPAND = 160
@@ -243,7 +243,7 @@ def sanitize_claims(raw_claims, ents, attrs):
         parts = s.split()
         ent, neg, attr = None, "", None
 
-        # Try "<Ent> is <attr>" or "<Ent> is not <attr>"
+
         if len(parts) >= 3 and parts[1].lower() == "is":
             ent = parts[0].capitalize()
             if len(parts) >= 4 and parts[2].lower() == "not":
@@ -508,7 +508,7 @@ def proofsketch_ultra_eval(df, save_prefix="proofsketch_ultra",
     print("Summary:", summary)
     return summary
 
-# ---- RUN it (same subset you used for baselines) ----
+# ---- RUN ----
 subset = df
 ultra_summary = proofsketch_ultra_eval(
     subset,
