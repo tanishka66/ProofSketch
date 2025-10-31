@@ -1,13 +1,14 @@
 import os, torch, re, time, numpy as np
+from tqdm import tqdm
 from huggingface_hub import login
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-
-MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"   
+# ----- config -----
+MODEL_NAME = ""   
 HF_TOKEN   = "" 
-HF_CACHE   = "/kaggle/working/hf_cache"              
-USE_4BIT   = False
-TEMPERATURE = 0.6
+HF_CACHE   = "/kaggle/working/hf_cache"           
+USE_4BIT   = True
+TEMPERATURE = 0.2
 MAX_NEW_TOKENS_SKETCH = 220
 MAX_NEW_TOKENS_EXPAND = 160
 
@@ -18,82 +19,57 @@ os.environ["HF_DATASETS_CACHE"] = os.path.join(HF_CACHE, "datasets")
 os.environ["TRANSFORMERS_CACHE"] = os.path.join(HF_CACHE, "transformers")
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"  
 
-
-if HF_TOKEN:
-    try:
-        login(token=HF_TOKEN, add_to_git_credential=True)
-        print("Hugging Face login successful.")
-    except Exception as e:
-        print("HF login failed (continuing without):", e)
-
-]
+# ----- Load tokenizer and model -----
 load_kwargs = {}
-if torch.cuda.is_available():
+if torch.cuda.is_available() and USE_4BIT:
     load_kwargs.update(dict(
         device_map="auto",
-        torch_dtype=torch.float16,   # or bfloat16 if you have an A100
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
         trust_remote_code=False,
     ))
 else:
     load_kwargs.update(dict(
         device_map="auto",
-        torch_dtype=torch.float32,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
         trust_remote_code=False,
     ))
 
-print("Downloading & loading:", MODEL_NAME)
+print("⏬ Downloading & loading:", MODEL_NAME)
 tok = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
-if tok.pad_token is None:
-    tok.pad_token = tok.eos_token  
-
 model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, **load_kwargs)
 model.eval()
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Model ready on:", device)
 
-def generate(prompt, max_new=220, temperature=0.0, do_sample=False, stop_at_json=False):
-    # make sure pad token is set
-    pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
-    if tok.pad_token_id is None and tok.eos_token_id is not None:
-        tok.pad_token = tok.eos_token
-
+# ----- Generation helpers & regex -----
+def _gen(prompt, max_new, temperature=TEMPERATURE, do_sample=False):
     inputs = tok(prompt, return_tensors="pt").to(model.device)
-    with torch.inference_mode():
+    with torch.no_grad():
         out = model.generate(
             **inputs,
             max_new_tokens=max_new,
             temperature=temperature,
             do_sample=do_sample,
-            pad_token_id=pad_id,
+            pad_token_id=tok.eos_token_id,
             eos_token_id=tok.eos_token_id,
         )
     full = tok.decode(out[0], skip_special_tokens=True)
     base = tok.decode(inputs["input_ids"][0], skip_special_tokens=True)
-    text = full[len(base):].strip()
+    return full[len(base):].strip()
 
-    if stop_at_json:
-        i = text.find("{")
-        if i != -1:
-            depth = 0
-            for j, ch in enumerate(text[i:], start=i):
-                if ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        return text[i:j+1]
-    return text
+CLAIM_LINE_RE = re.compile(r"^- +Claim +\d+: +(.+)$", re.I|re.M)
+ANS_LINE_RE   = re.compile(r"^- +Answer: +(True|False|Unknown)", re.I)
+def tokens_of(text): return len(tok(text).input_ids)
 
 
 
-TOKENIZER_NAME = ""
-tok = AutoTokenizer.from_pretrained(TOKENIZER_NAME, use_fast=True)
+# --- Rule-checker for Att* theories + vocab helpers ---
 
-def tokens_of(text: str) -> int:
-    """Approximate token count with local tokenizer."""
-    if not text:
-        return 0
-    return len(tok(text, add_special_tokens=False)["input_ids"])
-
-
+import re
+from typing import Dict, List, Tuple, Set
 
 def parse_theory(theory: str):
     facts_pos: Dict[str, Set[str]] = {}
@@ -160,7 +136,7 @@ def check_claim_atomic(claim: str, pos: Dict[str,set], neg: Dict[str,set]):
     ent, n, attr = m.group(1), m.group(2), m.group(3)
     return "verified" if (attr in (neg.get(ent,set()) if n else pos.get(ent,set()))) else "unverified"
 
-
+# --- Vocab extractor to fix AttributeError ---
 
 def extract_vocab_from_theory(theory: str):
     """
@@ -168,17 +144,17 @@ def extract_vocab_from_theory(theory: str):
     - Entities: capitalized single names (Anne, Harry, etc.)
     - Attributes: lowercase adjectives appearing after 'is/are' (+ parsed rules/facts)
     """
-
+    # Entities 
     ents = set(re.findall(r"\b[A-Z][a-z]+\b", theory))
 
-
+    # Attributes from surface patterns: "is <attr>", "is not <attr>", "are <attr>", "are not <attr>"
     attr_candidates = []
     for m in re.finditer(r"\bis\s+(?:not\s+)?([a-z]+)\b", theory):
         attr_candidates.append(m.group(1))
     for m in re.finditer(r"\bare\s+(?:not\s+)?([a-z]+)\b", theory):
         attr_candidates.append(m.group(1))
 
-
+    # Harvest from parsed facts and rules
     fpos, fneg, rules = parse_theory(theory)
     for s in fpos.values():
         attr_candidates.extend(list(s))
@@ -195,7 +171,7 @@ def extract_vocab_from_theory(theory: str):
     return ents, attrs
 
 
-
+# --- Strict JSON prompts + sanitize (robust) ---
 
 MAX_NEW_TOKENS_SKETCH = 220
 MAX_NEW_TOKENS_EXPAND = 160
@@ -243,7 +219,7 @@ def sanitize_claims(raw_claims, ents, attrs):
         parts = s.split()
         ent, neg, attr = None, "", None
 
-
+        # Try "<Ent> is <attr>" or "<Ent> is not <attr>"
         if len(parts) >= 3 and parts[1].lower() == "is":
             ent = parts[0].capitalize()
             if len(parts) >= 4 and parts[2].lower() == "not":
@@ -263,7 +239,7 @@ def sanitize_claims(raw_claims, ents, attrs):
         if ent_hit and attr_hit:
             cleaned.append(f"{ent_hit} is {attr_hit}")
 
-
+    # keep at most 3 claims; prefer unique
     uniq = []
     for c in cleaned:
         if c not in uniq:
@@ -293,7 +269,7 @@ def run_sketch(theory: str, question: str):
 
     data = extract_best_json(out)
     if data is None:
-        print("No valid JSON found, retrying once...")
+        print("No valid JSON found, retrying")
         out = generate(SKETCH_PROMPT.format(theory=theory, question=question),
                        160, temperature=0.0)
         print("\n[RAW MODEL OUTPUT - RETRY]")
@@ -325,7 +301,286 @@ def run_expand(theory: str, claim_text: str):
     return out
 
 
-# ===== ProofSketch++: certification-first voting + adaptive tokens + anchoring + closure correction =====
+def proofsketch_eval(df, max_expansions=2, verbose=True, print_every=1, max_print=5):
+    preds, golds, total_tokens, lat_ms, certified = [], [], [], [], []
+    printed = 0
+
+    for i, (_, r) in enumerate(tqdm(df.iterrows(), total=len(df)), start=1):
+        theory, question, gold = r.theory, r.question, str(r.answer)
+        t0 = time.time()
+
+        sketch_text, claims, pred = run_sketch(theory, question)
+
+        fpos,fneg,rules = parse_theory(theory)
+        pos,neg = derive_closure(fpos,fneg,rules)
+        verdicts = [check_claim_atomic(c, pos, neg) for c in claims]
+        needs = [c for c,v in zip(claims,verdicts) if v!="verified"]
+
+        expansions = [run_expand(theory, c) for c in needs[:max_expansions]]
+
+        elapsed_ms = 1000*(time.time()-t0)
+        tok_count  = tokens_of(sketch_text) + sum(tokens_of(e) for e in expansions)
+
+        preds.append(pred); golds.append(gold)
+        lat_ms.append(elapsed_ms); total_tokens.append(tok_count)
+        certified.append(len(needs)==0)
+
+        if verbose and (i % print_every == 0) and (printed < (max_print or 10**9)):
+            printed += 1
+            print("="*90)
+            print(f"Example {i}/{len(df)} | id: {r.get('id', i)}")
+            print(f"Gold: {gold} | Pred: {pred} | tokens={tok_count} | latency={elapsed_ms:.1f} ms | certified={len(needs)==0}")
+            print("- QUESTION:", question)
+            print("- CLAIMS:", [f"{c} -> {v}" for c,v in zip(claims, verdicts)])
+            if expansions:
+                print("[EXPANSIONS]:")
+                for e in expansions: print(e)
+
+    acc = float(np.mean([p.lower()==g.lower() for p,g in zip(preds,golds)]))
+    return {
+        "acc": acc,
+        "mean_tokens": float(np.mean(total_tokens)),
+        "p95_tokens": float(np.percentile(total_tokens,95)),
+        "mean_latency_ms": float(np.mean(lat_ms)),
+        "certified_fraction": float(np.mean(certified))
+    }
+
+
+# ===== PATCH: robust vocab + sanitizer + JSON picker =====
+import re, json
+
+# Entities: proper names (Anne) and "The x" noun phrases that appear in the theory
+def extract_vocab_from_theory(theory: str):
+    proper = {m.group(0) for m in re.finditer(r"\b[A-Z][a-z]+\b", theory)}
+    nouns  = {f"The {m.group(1).lower()}" for m in re.finditer(r"\b[Tt]he\s+([a-z]+)\b", theory)}
+    ents   = proper | nouns
+
+    # attributes from surface patterns and simple rules/facts
+    attr_candidates = []
+    for m in re.finditer(r"\bis\s+(?:not\s+)?([a-z]+)\b", theory):
+        attr_candidates.append(m.group(1))
+    for m in re.finditer(r"\bare\s+(?:not\s+)?([a-z]+)\b", theory):
+        attr_candidates.append(m.group(1))
+
+    # scrape from simple facts "X is (not) a" too (supports The x)
+    for s in [t.strip() for t in theory.split('.') if t.strip()]:
+        m = re.match(r"^(?:(?:[A-Z][a-z]+)|(?:[Tt]he\s+[a-z]+))\s+is\s+(?:not\s+)?([a-z]+)$", s)
+        if m:
+            attr_candidates.append(m.group(1))
+
+    attrs = {a for a in attr_candidates if a.isalpha() and a.islower()}
+    return ents, attrs
+
+# Canonicalize entity tokens to either ProperCase or "The x"
+def _canon_entity(token: str):
+    token = token.strip()
+    if re.match(r"^[A-Z][a-z]+$", token):
+        return token
+    m = re.match(r"^(?:[Tt]he)\s+([a-z]+)$", token)
+    if m:
+        return f"The {m.group(1).lower()}"
+    return token
+
+# Strict claim parser: "<Ent> is <attr>" or "<Ent> is not <attr>"
+_CLAIM_PARSE = re.compile(r"^(?P<ent>(?:[A-Z][a-z]+|[Tt]he\s+[a-z]+))\s+is\s+(?P<not>not\s+)?(?P<attr>[a-z]+)$")
+
+def sanitize_claims(raw_claims, ents, attrs):
+    """
+    Keep only atomic claims whose entity ∈ ents and attribute ∈ attrs.
+    Normalize entity casing ("lion" -> "The lion"), attribute lowercasing,
+    and drop anything not in vocab (fixes 'Green is green', 'bear is bear', etc.).
+    """
+    canon_ents = {_canon_entity(e) for e in ents}
+    cleaned = []
+
+    for c in raw_claims:
+        s = str(c).strip().rstrip(".")
+        m = _CLAIM_PARSE.match(s)
+        ent, is_neg, attr = None, False, None
+
+        if m:
+            ent  = _canon_entity(m.group('ent'))
+            is_neg = bool(m.group('not'))
+            attr = m.group('attr').lower()
+        else:
+            #light recovery for lowercase starts like "lion is cold"
+            parts = s.split()
+            if len(parts) >= 3 and parts[1].lower() == "is":
+                if parts[0].lower() == "the" and len(parts) >= 4:
+                    ent = _canon_entity(" ".join(parts[:2]))  # "the lion" -> "The lion"
+                    third = parts[2].lower()
+                    if third == "not" and len(parts) >= 4:
+                        is_neg = True
+                        attr = parts[3].lower()
+                    else:
+                        attr = parts[2].lower()
+                else:
+                    # single-token entity like "charlie is kind"
+                    ent = _canon_entity(parts[0].capitalize())
+                    if len(parts) >= 4 and parts[2].lower() == "not":
+                        is_neg = True
+                        attr = parts[3].lower()
+                    else:
+                        attr = parts[2].lower()
+
+        # Final gate: entity and attr must be in vocab
+        if ent in canon_ents and attr in attrs:
+            cleaned.append(f"{ent} is {'not ' if is_neg else ''}{attr}")
+
+    # dedupe, keep ≤3
+    uniq = []
+    for cl in cleaned:
+        if cl not in uniq:
+            uniq.append(cl)
+    return uniq[:3]
+
+def extract_best_json(text: str):
+    """
+    Prefer the JSON block right after 'ANSWER:' (common format observed),
+    else fall back to the longest valid JSON that has both 'claims' and 'answer'.
+    """
+    # 1) Look for ANSWER: then the next {...}
+    m_ans = re.search(r"ANSWER:\s*(```json)?\s*\{", text, re.IGNORECASE)
+    if m_ans:
+        start = m_ans.start()
+        # find first {...} after this point
+        m_json = re.search(r"\{.*?\}", text[start:], flags=re.DOTALL)
+        if m_json:
+            cand = m_json.group(0)
+            try:
+                obj = json.loads(cand)
+                if isinstance(obj, dict) and "claims" in obj and "answer" in obj:
+                    return obj
+            except Exception:
+                pass
+
+    # 2) Fallback: scan all JSON-ish blocks and pick the longest valid one with keys
+    best = None
+    for m in re.finditer(r"\{.*?\}", text, flags=re.DOTALL):
+        cand = m.group(0)
+        try:
+            obj = json.loads(cand)
+            if isinstance(obj, dict) and "claims" in obj and "answer" in obj:
+                if best is None or len(cand) > len(best):
+                    best = cand
+        except Exception:
+            continue
+    return json.loads(best) if best else None
+
+
+# ===== Boost ProofSketch: anchoring + 3-vote + closure correction =====
+import re
+
+def _question_entity(q: str):
+    m = re.match(r"^(The\s+[a-z]+|[A-Z][a-z]+)\s+is\s+(?:not\s+)?([a-z]+)\.?$", q.strip())
+    if not m: return None, None, None
+    ent = m.group(1)
+    ent = ent if re.match(r"^[A-Z][a-z]+$", ent) else ("The " + ent.split()[1].lower())
+    attr = m.group(2).lower()
+    neg  = bool(re.search(r"\bis\s+not\b", q))
+    return ent, attr, neg
+
+def _closure_decides(ent, attr, neg, pos, negset):
+    if ent is None: return None
+    has_pos = attr in pos.get(ent, set())
+    has_neg = attr in negset.get(ent, set())
+    if not has_pos and not has_neg: return None
+    if not neg and has_pos: return "True"
+    if not neg and has_neg: return "False"
+    if neg and has_pos:     return "False"
+    if neg and has_neg:     return "True"
+    return None
+
+def _anchor_claims(claims, theory, question):
+    qe, _, _ = _question_entity(question)
+    if not qe or not claims: return claims
+    fpos,fneg,rules = parse_theory(theory); pos,neg = derive_closure(fpos,fneg,rules)
+
+    about_q = [c for c in claims if c.startswith(qe + " is ")]
+    if about_q: return about_q[:3]
+
+    verified_q = []
+    for a in pos.get(qe, set()): verified_q.append(f"{qe} is {a}")
+    for a in neg.get(qe, set()): verified_q.append(f"{qe} is not {a}")
+    if verified_q:
+        base = [verified_q[0]]
+        for c in claims:
+            if len(base) >= 3: break
+            if c not in base: base.append(c)
+        return base[:3]
+    return claims[:3]
+
+def run_sketch_once(theory, question, max_new=MAX_NEW_TOKENS_SKETCH, temp=0.0):
+    raw = generate(SKETCH_PROMPT.format(theory=theory, question=question), max_new,
+                   temperature=temp, do_sample=(temp>0), stop_at_json=True)
+    try:
+        obj = extract_best_json(raw) or {}
+    except Exception:
+        obj = {}
+    raw_claims = obj.get("claims", [])
+    pred       = str(obj.get("answer","Unknown"))
+    ents, attrs = extract_vocab_from_theory(theory)
+    claims = sanitize_claims(raw_claims, ents, attrs)
+    claims = _anchor_claims(claims, theory, question)
+    return raw, claims, pred
+
+def run_sketch_voted(theory, question, votes=3, temp=0.2):
+    fpos,fneg,rules = parse_theory(theory); pos,neg = derive_closure(fpos,fneg,rules)
+    qe, qattr, qneg = _question_entity(question)
+    closure_ans = _closure_decides(qe, qattr, qneg, pos, neg)
+
+    best = None 
+    for _ in range(votes):
+        raw, claims, pred = run_sketch_once(theory, question, temp=temp)
+        verdicts = [check_claim_atomic(c, pos, neg) for c in claims]
+        score = sum(v=="verified" for v in verdicts)
+        toks = tokens_of(raw)
+        consistent = 1 if (closure_ans is not None and pred.lower()==closure_ans.lower()) else 0
+        cand = (score, -toks, consistent, (raw, claims, pred))
+        best = max(best, cand) if best else cand
+
+    raw, claims, pred = best[3]
+    if closure_ans is not None:
+        pred = closure_ans
+    return raw, claims, pred
+
+
+
+# ===== Canonical entity patch + helper =====
+import re
+
+def canon_ent(ent: str):
+    s = ent.strip()
+    # Proper name "Anne" → keep
+    if re.match(r"^[A-Z][a-z]+$", s):
+        return s
+    # Noun phrase variants: "The bear" / "the bear" / "bear" → "The bear"
+    m = re.match(r"^(?:the\s+)?([a-z]+)$", s, flags=re.I)
+    if m:
+        return f"The {m.group(1).lower()}"
+    m = re.match(r"^(?:the\s+)([a-z]+)$", s, flags=re.I)
+    if m:
+        return f"The {m.group(1).lower()}"
+    return s
+
+def canonize_closure(pos: dict, neg: dict):
+    def remap(d):
+        out = {}
+        for e, attrs in d.items():
+            ce = canon_ent(e)
+            out.setdefault(ce, set()).update(attrs)
+        return out
+    return remap(pos), remap(neg)
+
+def get_closure(theory: str):
+    """Build closure and canonicalize entity keys so they match claims like 'The bear ...'."""
+    fpos, fneg, rules = parse_theory(theory)
+    pos, neg = derive_closure(fpos, fneg, rules)
+    pos, neg = canonize_closure(pos, neg)
+    return pos, neg
+
+
+# ===== ProofSketch: certification-first voting + adaptive tokens + anchoring + closure correction =====
 import re, json, time, numpy as np, pandas as pd
 from tqdm import tqdm
 
@@ -349,52 +604,45 @@ def _closure_decides(ent, attr, is_neg, pos, neg):
     if is_neg and has_neg:     return "True"
     return None
 
-# --------- Make a single verified claim if possible (boosts certification) ----------
+# --------- Getting single verified claim if possible ----------
 def _one_verified_claim(theory, question, pos, neg):
     qe, _, _ = _question_literal(question)
-    # Prefer about the question entity
     if qe:
         if pos.get(qe): return [f"{qe} is {next(iter(pos[qe]))}"]
         if neg.get(qe): return [f"{qe} is not {next(iter(neg[qe]))}"]
-    # Else any verified fact
     for e, attrs in pos.items():
         if attrs: return [f"{e} is {next(iter(attrs))}"]
     for e, attrs in neg.items():
         if attrs: return [f"{e} is not {next(iter(attrs))}"]
     return []
 
-# --------- Strict anchoring: collapse to 1 verified claim when possible ----------
+# --------- Strict anchoring ----------
 def _anchor_claims(theory, question, claims, pos, neg):
     qe, _, _ = _question_literal(question)
     if qe:
-        # If we have any verified fact about QE, use just that 
+        # If we have any verified fact about QE
         if pos.get(qe) or neg.get(qe):
             return _one_verified_claim(theory, question, pos, neg)
-        # Else, keep only QE claims if present (still 1 claim to help certification)
+        # Else, keep only QE claims if present 
         about_q = [c for c in claims if c.startswith(qe + " is ")]
         if about_q:
             return [about_q[0]]
     # No QE verified; fallback to one global verified claim if any
     v1 = _one_verified_claim(theory, question, pos, neg)
     if v1: return v1
-    # Last resort: keep at most one sanitized claim
+    # keep at most one sanitized claim
     return claims[:1]
 
 # --------- One sketch sample (short budget) ----------
 def _gen_sketch_once_strict(theory, question, max_new, temp):
-    raw = generate(
-        SKETCH_PROMPT.format(theory=theory, question=question),
-        max_new_tokens=max_new,      
-        temperature=temp,
-        do_sample=(temp > 0),
-        stop_at_json=True
-    )
+    raw = generate(SKETCH_PROMPT.format(theory=theory, question=question),
+                   max_new=max_new, temperature=temp, do_sample=(temp>0), stop_at_json=True)
     try:
         obj = extract_best_json(raw) or {}
     except Exception:
         obj = {}
     raw_claims = obj.get("claims", [])
-    pred       = str(obj.get("answer", "Unknown"))
+    pred       = str(obj.get("answer","Unknown"))
 
     ents, attrs = extract_vocab_from_theory(theory)
     claims = sanitize_claims(raw_claims, ents, attrs)
@@ -402,15 +650,14 @@ def _gen_sketch_once_strict(theory, question, max_new, temp):
 
 # --------- Certification-first voter with early stop + adaptive token budget ----------
 def run_sketch_voted_plus(theory, question, max_votes=4, base_tokens=120, long_tokens=160, temp=0.3):
-    # Compute closure once
-    fpos,fneg,rules = parse_theory(theory); pos,neg = derive_closure(fpos,fneg,rules)
+    # Compute closure 
+    pos, neg = get_closure(theory)
     qe, qattr, qneg = _question_literal(question)
     closure_ans = _closure_decides(qe, qattr, qneg, pos, neg)
-
-    # Adaptive token budget: if we already have some closure facts about QE, use shorter budget
+    
     sketch_tokens = base_tokens if (qe and (pos.get(qe) or neg.get(qe))) else long_tokens
 
-    best = None  # (all_cert, verified_count, -tokens, consistent, (raw, claims, pred))
+    best = None  
     for v in range(max_votes):
         raw, claims, pred = _gen_sketch_once_strict(theory, question, max_new=sketch_tokens, temp=temp)
 
@@ -429,17 +676,17 @@ def run_sketch_voted_plus(theory, question, max_votes=4, base_tokens=120, long_t
         # EARLY STOP: fully certified sketch found
         if all_cert:
             break
-        # Also early stop if we already have 2 verified claims (rare with 1-claim policy)
+        # Also early stop if we already have 2 verified claims
         if vcount >= 2:
             break
 
     raw, claims, pred = best[4]
-    # Closure correction of the final label (free accuracy)
+    # Closure correction of the final label
     if closure_ans is not None:
         pred = closure_ans
     return raw, claims, pred
 
-# --------- Evaluator: ProofSketch-only (improved), prints + saves ---------
+# --------- Evaluator ---------
 def proofsketch_ultra_eval(df, save_prefix="proofsketch_ultra",
                            max_votes=4, base_tokens=120, long_tokens=160, temp=0.3,
                            verbose=True, print_every=1, max_print=8):
@@ -454,7 +701,7 @@ def proofsketch_ultra_eval(df, save_prefix="proofsketch_ultra",
             theory, question,
             max_votes=max_votes, base_tokens=base_tokens, long_tokens=long_tokens, temp=temp
         )
-        fpos,fneg,rules = parse_theory(theory); pos,neg = derive_closure(fpos,fneg,rules)
+        pos, neg = get_closure(theory)
         verdicts = [check_claim_atomic(c, pos, neg) for c in claims]
 
         tok = tokens_of(raw); elapsed_ms = 1000*(time.time()-t0)
@@ -508,15 +755,14 @@ def proofsketch_ultra_eval(df, save_prefix="proofsketch_ultra",
     print("Summary:", summary)
     return summary
 
-# ---- RUN ----
+#Run  
 subset = df
 ultra_summary = proofsketch_ultra_eval(
     subset,
     save_prefix="proofsketch_ultra",
     max_votes=4,       # allow up to 4 samples, but early-stop when certified
-    base_tokens=120,   # short budget when QE has closure facts
-    long_tokens=160,   # slightly longer if closure is empty for QE
-    temp=0.3,        
+    base_tokens=120,  
+    long_tokens=160,  
+    temp=0.3,          
     verbose=True, print_every=1, max_print=8
 )
-
