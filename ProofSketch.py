@@ -16,7 +16,7 @@ os.makedirs(HF_CACHE, exist_ok=True)
 os.environ["HF_HOME"] = HF_CACHE
 os.environ["HF_DATASETS_CACHE"] = os.path.join(HF_CACHE, "datasets")
 os.environ["TRANSFORMERS_CACHE"] = os.path.join(HF_CACHE, "transformers")
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"  # faster dl
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"  
 
 
 if HF_TOKEN:
@@ -44,7 +44,7 @@ else:
 print("Downloading & loading:", MODEL_NAME)
 tok = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
 if tok.pad_token is None:
-    tok.pad_token = tok.eos_token  # avoid padding warnings
+    tok.pad_token = tok.eos_token  
 
 model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, **load_kwargs)
 model.eval()
@@ -178,7 +178,7 @@ def extract_vocab_from_theory(theory: str):
     for m in re.finditer(r"\bare\s+(?:not\s+)?([a-z]+)\b", theory):
         attr_candidates.append(m.group(1))
 
-    # Also harvest from parsed facts and rules (more reliable)
+
     fpos, fneg, rules = parse_theory(theory)
     for s in fpos.values():
         attr_candidates.extend(list(s))
@@ -263,7 +263,7 @@ def sanitize_claims(raw_claims, ents, attrs):
         if ent_hit and attr_hit:
             cleaned.append(f"{ent_hit} is {attr_hit}")
 
-    # keep at most 3 claims; prefer unique
+
     uniq = []
     for c in cleaned:
         if c not in uniq:
@@ -367,7 +367,7 @@ def _one_verified_claim(theory, question, pos, neg):
 def _anchor_claims(theory, question, claims, pos, neg):
     qe, _, _ = _question_literal(question)
     if qe:
-        # If we have any verified fact about QE, use just that (easier to certify)
+        # If we have any verified fact about QE, use just that 
         if pos.get(qe) or neg.get(qe):
             return _one_verified_claim(theory, question, pos, neg)
         # Else, keep only QE claims if present (still 1 claim to help certification)
